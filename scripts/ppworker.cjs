@@ -1,91 +1,61 @@
-const sharp = require('sharp')
 const fs = require('fs-extra')
 const path = require('path')
+const { execSync } = require('child_process')
 const ppconfig = require('./ppconfig.json')
 
-// icon size
-const DENSITIES = {
-    mdpi: 48,
-    hdpi: 72,
-    xhdpi: 96,
-    xxhdpi: 144,
-    xxxhdpi: 192,
-}
-
-// generate adaptive icons
-const generateAdaptiveIcons = async (input, outputDir) => {
-    for (const [dpi, size] of Object.entries(DENSITIES)) {
-        const mipmapDir = path.join(outputDir, `mipmap-${dpi}`)
-        await fs.ensureDir(mipmapDir)
-        const foregroundPath = path.join(
-            mipmapDir,
-            'ic_launcher_foreground.webp'
-        )
-        const backgroundPath = path.join(
-            mipmapDir,
-            'ic_launcher_background.webp'
-        )
-        const legacyPath = path.join(mipmapDir, 'ic_launcher.webp')
-        const legacyRoundPath = path.join(mipmapDir, 'ic_launcher_round.webp')
-
-        // 创建圆形遮罩
-        const roundedMask = Buffer.from(
-            `<svg><circle cx="${size / 2}" cy="${size / 2}" r="${
-                size / 2
-            }" fill="white"/></svg>`
-        )
-
-        // 生成普通图标
-        const img = sharp(input).resize(size, size)
-        await img.webp().toFile(foregroundPath)
-        await img.webp().toFile(legacyPath)
-
-        // 生成圆形图标
-        const roundedImg = img.composite([
-            {
-                input: roundedMask,
-                blend: 'dest-in',
-            },
-        ])
-        await roundedImg.webp().toFile(legacyRoundPath)
-
-        // 生成背景
-        await sharp({
-            create: {
-                width: size,
-                height: size,
-                channels: 4,
-                background: '#FFFFFF',
-            },
-        })
-            .webp()
-            .toFile(backgroundPath)
+function generateAdaptiveIcons(input, output) {
+    const densities = {
+        'mipmap-mdpi': 48,
+        'mipmap-hdpi': 72,
+        'mipmap-xhdpi': 96,
+        'mipmap-xxhdpi': 144,
+        'mipmap-xxxhdpi': 192,
     }
 
-    // Generate XML
-    const xmlPath = path.join(outputDir, 'mipmap-anydpi-v26')
-    await fs.ensureDir(xmlPath)
-    await fs.writeFile(
-        path.join(xmlPath, 'ic_launcher.xml'),
-        `
+    // icon背景颜色,可设置为none透明
+    const bgColor = '#FFFFFF'
+    // 一般0.75, 前景最大占比（安全区）
+    const foregroundScale = 0.68
+
+    if (!fs.existsSync(output)) {
+        fs.mkdirSync(output, { recursive: true })
+    }
+
+    for (const [folder, size] of Object.entries(densities)) {
+        const dir = path.join(output, folder)
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+
+        const backgroundFile = path.join(dir, 'ic_launcher_background.png')
+        const foregroundFile = path.join(dir, 'ic_launcher_foreground.png')
+
+        // linux只能convert， 背景：纯色填充（全覆盖）
+        execSync(
+            `convert -size ${size}x${size} canvas:"${bgColor}" ${backgroundFile}`
+        )
+
+        // 前景大小 = 图标尺寸 × 0.75
+        const fgSize = Math.round(size * foregroundScale)
+
+        // 前景：缩放到安全区域，居中，四周自动留边
+        execSync(
+            `convert "${input}" -resize ${fgSize}x${fgSize} ` +
+                `-gravity center -background none -extent ${size}x${size} ${foregroundFile}`
+        )
+    }
+
+    // 生成 Adaptive Icon XML (放到 mipmap-anydpi-v26)
+    const anydpiDir = path.join(output, 'mipmap-anydpi-v26')
+    if (!fs.existsSync(anydpiDir)) fs.mkdirSync(anydpiDir, { recursive: true })
+
+    const xml = `<?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@mipmap/ic_launcher_background"/>
     <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
-</adaptive-icon>
-  `.trim()
-    )
+</adaptive-icon>`
 
-    await fs.writeFile(
-        path.join(xmlPath, 'ic_launcher_round.xml'),
-        `
-<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-    <background android:drawable="@mipmap/ic_launcher_background"/>
-    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
-</adaptive-icon>
-  `.trim()
-    )
+    fs.writeFileSync(path.join(anydpiDir, 'ic_launcher.xml'), xml, 'utf-8')
 
-    console.log('✅ Adaptive icons generated in WebP format.')
+    console.log('✅ Adaptive Icons 已生成:', output)
 }
 
 const updateAppName = async (androidResDir, appName) => {
@@ -133,10 +103,8 @@ const updateAppName = async (androidResDir, appName) => {
     }
 }
 
-const updateWebEnv = async (androidResDir, webUrl, debug, webview) => {
+const updateSafeArea = async (androidResDir, safeArea) => {
     try {
-        const { userAgent } = webview
-
         // Assuming MainActivity.kt is in the standard location
         const mainActivityPath = path.join(
             androidResDir.replace('res', ''),
@@ -152,36 +120,49 @@ const updateWebEnv = async (androidResDir, webUrl, debug, webview) => {
             )
             return
         }
-
         // Read and update the file
         let content = await fs.readFile(mainActivityPath, 'utf8')
 
-        // Replace the web URL in the loadUrl call
-        let updatedContent = content.replace(
-            /webView\.loadUrl\(".*?"\)/,
-            `webView.loadUrl("${webUrl}")`
-        )
-        // if debug is true, add debug mode
-        console.log('webview debug to:', debug)
-        if (debug) {
-            updatedContent = updatedContent.replace(
-                'private var debug = false',
-                'private var debug = true'
-            )
+        // update safeArea
+        if (safeArea) {
+            if (safeArea === 'all') {
+                console.log('webview debug to all')
+            } else if (safeArea === 'top') {
+                content = content.replace(
+                    'view.setPadding(systemBar.left, systemBar.top, systemBar.right, systemBar.bottom)',
+                    `view.setPadding(0, systemBar.top, 0, 0)`
+                )
+            } else if (safeArea === 'bottom') {
+                content = content.replace(
+                    'view.setPadding(systemBar.left, systemBar.top, systemBar.right, systemBar.bottom)',
+                    `view.setPadding(0, 0, 0, systemBar.bottom)`
+                )
+            } else if (safeArea === 'left') {
+                content = content.replace(
+                    'view.setPadding(systemBar.left, systemBar.top, systemBar.right, systemBar.bottom)',
+                    `view.setPadding(systemBar.left, 0, 0, 0)`
+                )
+            } else if (safeArea === 'right') {
+                content = content.replace(
+                    'view.setPadding(systemBar.left, systemBar.top, systemBar.right, systemBar.bottom)',
+                    `view.setPadding(0, 0, systemBar.right, 0)`
+                )
+            } else if (safeArea === 'horizontal') {
+                content = content.replace(
+                    'view.setPadding(systemBar.left, systemBar.top, systemBar.right, systemBar.bottom)',
+                    `view.setPadding(systemBar.left, 0, systemBar.right, 0)`
+                )
+            } else if (safeArea === 'vertical') {
+                content = content.replace(
+                    'view.setPadding(systemBar.left, systemBar.top, systemBar.right, systemBar.bottom)',
+                    `view.setPadding(0, systemBar.top, 0, systemBar.bottom)`
+                )
+            }
         }
-
-        // update webview userAgent
-        if (userAgent) {
-            updatedContent = updatedContent.replace(
-                '// webView.settings.userAgentString = ""',
-                `webView.settings.userAgentString = "${userAgent}"`
-            )
-        }
-
-        await fs.writeFile(mainActivityPath, updatedContent)
-        console.log(`✅ Updated web URL to: ${webUrl}`)
+        await fs.writeFile(mainActivityPath, content)
+        console.log(`✅ Updated safeArea to: ${safeArea}`)
     } catch (error) {
-        console.error('❌ Error updating web URL:', error)
+        console.error('❌ Error updating safeArea:', error)
     }
 }
 
@@ -253,7 +234,7 @@ const setGithubEnv = (name, version, pubBody) => {
 }
 
 // update android applicationId
-const updateAndroidId = async (id) => {
+const upAppIdVersion = async (id, version) => {
     const gradlePath = path.join(__dirname, '../app/build.gradle.kts')
     const exists = await fs.pathExists(gradlePath)
     if (!exists) {
@@ -265,23 +246,268 @@ const updateAndroidId = async (id) => {
     let content = await fs.readFile(gradlePath, 'utf8')
 
     // Replace the applicationId
-    const updatedContent = content.replace(
+    content = content.replace(
         /applicationId = ".*?"/,
         `applicationId = "${id}"`
     )
 
+    // Replace the versionName
+    content = content.replace(
+        /versionName = ".*?"/,
+        `versionName = "${version}"`
+    )
+
     // Write back only if changes were made
-    if (updatedContent !== content) {
-        await fs.writeFile(gradlePath, updatedContent)
-        console.log(`✅ Updated applicationId to: ${id}`)
-    } else {
-        console.log('ℹ️ No changes needed in build.gradle.kts')
+    await fs.writeFile(gradlePath, content)
+    console.log(`✅ Updated Id: ${id} and version: ${version}`)
+}
+
+// clear launch config
+const clearLaunch = async () => {
+    const launchPath = path.join(
+        __dirname,
+        '../app/src/main/res/drawable/launch.jpg'
+    )
+    if (fs.existsSync(launchPath)) {
+        fs.removeSync(launchPath)
+        console.log(`📦 launch.jpg deleted from Android res dir`)
     }
+    // clear single_main.xml
+    const singleMainPath = path.join(
+        __dirname,
+        '../app/src/main/res/layout/single_main.xml'
+    )
+    if (fs.existsSync(singleMainPath)) {
+        let content = fs.readFileSync(singleMainPath, 'utf8')
+        content = content.replace('android:src="@drawable/launch"', '')
+        fs.writeFileSync(singleMainPath, content)
+        console.log(`📦 single_main.xml updated: ${singleMainPath}`)
+    }
+}
+
+// update pppwd.html
+const updatePPPwdHtml = (
+    startMethod,
+    startPwd,
+    pwdTitle,
+    pwdBtn,
+    pwdPlace,
+    pwdTip,
+    pwdError,
+    pwdStyle,
+    pwdTheme,
+    webUrl,
+    isHtml
+) => {
+    console.log('updatePPPwdHtml......')
+    const indexHtmlPath = path.join(__dirname, './www/pppwd.html')
+    const indexHtml = fs.readFileSync(indexHtmlPath, 'utf-8')
+    const targetUrl = isHtml ? './index.html' : webUrl
+    const newIndexHtml = indexHtml
+        .replaceAll('startMethod', startMethod)
+        .replaceAll('startPwd', startPwd || '123456')
+        .replaceAll('pwdTitle', pwdTitle || '请输入密码')
+        .replaceAll('pwdBtn', pwdBtn || '验证')
+        .replaceAll('pwdPlace', pwdPlace || '')
+        .replaceAll('pwdTip', pwdTip || '')
+        .replaceAll('pwdError', pwdError || '密码错误')
+        .replaceAll('pwdStyle', pwdStyle || 'flat')
+        .replaceAll('pwdTheme', pwdTheme || 'dark')
+        .replaceAll('https://pakeplus.com/', targetUrl)
+    fs.writeFileSync(indexHtmlPath, newIndexHtml)
+    console.log('updatePPPwdHtml success')
+}
+
+// copy html to android res dir
+const initWebEnv = async (
+    isHtml,
+    webUrl,
+    debug,
+    safeArea,
+    userAgent,
+    launchImage,
+    screenOn,
+    clearCache,
+    callPhone,
+    download,
+    internet,
+    position,
+    startMethod
+) => {
+    const assetsPath = path.join(__dirname, '../app/src/main/assets')
+    const appJsonPath = path.join(assetsPath, 'app.json')
+    // load app.json
+    const appJson = fs.readFileSync(appJsonPath, 'utf8')
+    // appJson object
+    const appJsonObj = JSON.parse(appJson)
+    // userAgent
+    if (userAgent) {
+        appJsonObj.userAgent = userAgent
+    } else {
+        appJsonObj.userAgent = ''
+    }
+    // set fullScreen
+    if (safeArea === 'fullscreen') {
+        appJsonObj.fullScreen = true
+    } else {
+        appJsonObj.fullScreen = false
+    }
+    // set screenOn
+    if (screenOn) {
+        appJsonObj.screenOn = true
+    } else {
+        appJsonObj.screenOn = false
+    }
+    // clearCache
+    if (clearCache) {
+        appJsonObj.clearCache = true
+    } else {
+        appJsonObj.clearCache = false
+    }
+    // set callPhone
+    if (callPhone) {
+        appJsonObj.callPhone = true
+    } else {
+        appJsonObj.callPhone = false
+    }
+    // set download
+    if (download) {
+        appJsonObj.download = true
+    } else {
+        appJsonObj.download = false
+    }
+    // set internet
+    if (internet) {
+        appJsonObj.internet = true
+    } else {
+        appJsonObj.internet = false
+    }
+    // set position
+    if (position) {
+        appJsonObj.position = true
+    } else {
+        appJsonObj.position = false
+    }
+    // set html
+    if (startMethod === 'password' || startMethod === 'oncePwd') {
+        appJsonObj.webUrl = 'file:///android_asset/pppwd.html'
+    } else if (isHtml) {
+        // update webUrl
+        appJsonObj.webUrl = 'file:///android_asset/index.html'
+    } else {
+        appJsonObj.webUrl = webUrl
+    }
+    // is debug
+    if (debug) {
+        // update debug
+        appJsonObj.debug = true
+    } else {
+        appJsonObj.debug = false
+        const vConsolePath = path.join(assetsPath, 'vConsole.js')
+        // delete vConsole.js
+        fs.removeSync(vConsolePath)
+        console.log(`📦 vConsole.js deleted from Android res dir`)
+    }
+    if (startMethod === 'password' || startMethod === 'oncePwd') {
+        // scripts/www/*
+        const htmlPath = path.join(__dirname, './www/*')
+        // copy to app/src/main/assets
+        execSync(`cp -r ${htmlPath} ${assetsPath}`)
+        console.log(`📦 HTML copied to Android res dir: ${assetsPath}`)
+    } else if (isHtml) {
+        // scripts/www/*
+        const htmlPath = path.join(__dirname, './www/*')
+        // copy to app/src/main/assets
+        execSync(`cp -r ${htmlPath} ${assetsPath}`)
+        console.log(`📦 HTML copied to Android res dir: ${assetsPath}`)
+    } else {
+        // delete app/src/main/assets/pppwd.html
+        const indexHtmlPath = path.join(assetsPath, 'pppwd.html')
+        await fs.remove(indexHtmlPath)
+        console.log(`📦 pppwd.html deleted from Android assets`)
+    }
+    // set launch
+    if (launchImage) {
+        appJsonObj.launch = launchImage
+        // copy launch image to android res dir
+        const launchPath = path.join(__dirname, `../launch.jpg`)
+        const launchResPath = path.join(
+            __dirname,
+            '../app/src/main/res/drawable/launch.jpg'
+        )
+        fs.copySync(launchPath, launchResPath)
+        console.log(`📦 launch copied to Android res dir: ${launchResPath}`)
+    } else {
+        appJsonObj.launch = ''
+        clearLaunch()
+        console.log(`📦 launch deleted from Android res dir`)
+    }
+    // update app.json
+    await fs.writeFile(appJsonPath, JSON.stringify(appJsonObj, null, 2), 'utf8')
+    console.log(`✅ app.json updated: ${appJsonPath}`)
+}
+
+// create keystore
+const createKeystore = async () => {
+    const keystore = path.join(__dirname, './pakeplus.txt')
+    const keystorePath = path.join(__dirname, '../pakeplus.keystore')
+    // copy keystore to keystorePath
+    fs.copySync(keystore, keystorePath)
+    console.log(`📦 pakeplus.keystore created: ${keystorePath}`)
+}
+
+// update manifest.xml
+const updateManifest = async (direction = 'default') => {
+    const manifestPath = path.join(
+        __dirname,
+        '../app/src/main/AndroidManifest.xml'
+    )
+    let content = await fs.readFile(manifestPath, 'utf8')
+    // update screenOrientation
+    if (direction === 'default') {
+        content = content.replace(
+            /android:screenOrientation=".*?"/,
+            `android:screenOrientation="unspecified"`
+        )
+    } else if (direction === 'horizontal') {
+        content = content.replace(
+            /android:screenOrientation=".*?"/,
+            `android:screenOrientation="sensorLandscape"`
+        )
+    } else if (direction === 'vertical') {
+        content = content.replace(
+            /android:screenOrientation=".*?"/,
+            `android:screenOrientation="sensorPortrait"`
+        )
+    } else {
+        console.log('⚠️ Invalid direction:', direction)
+    }
+    await fs.writeFile(manifestPath, content)
+    console.log(`✅ manifest.xml updated: ${manifestPath}`)
 }
 
 // Main execution
 const main = async () => {
-    const { webview } = ppconfig.phone
+    const {
+        webview,
+        launchImage,
+        screenOn,
+        direction,
+        callPhone,
+        download,
+        internet,
+        position,
+        startMethod,
+        startPwd,
+        pwdTitle,
+        pwdBtn,
+        pwdPlace,
+        pwdTip,
+        pwdError,
+        pwdStyle,
+        pwdTheme,
+    } = ppconfig.phone
+
     const {
         name,
         version,
@@ -293,10 +519,12 @@ const main = async () => {
         webUrl,
         showName,
         debug,
+        safeArea,
+        isHtml,
     } = ppconfig.android
 
     const outPath = path.resolve(output)
-    await generateAdaptiveIcons(input, outPath)
+    generateAdaptiveIcons(input, outPath)
 
     const dest = path.resolve(copyTo)
     await fs.copy(outPath, dest, { overwrite: true })
@@ -306,16 +534,57 @@ const main = async () => {
     await updateAppName(dest, showName)
 
     // Update web URL if provided
-    await updateWebEnv(dest, webUrl, debug, webview)
+    await updateSafeArea(dest, safeArea)
+
+    // update pppwd.html
+    updatePPPwdHtml(
+        startMethod,
+        startPwd,
+        pwdTitle,
+        pwdBtn,
+        pwdPlace,
+        pwdTip,
+        pwdError,
+        pwdStyle,
+        pwdTheme,
+        webUrl,
+        isHtml
+    )
 
     // 删除根目录的res
     await fs.remove(outPath)
 
     // update android applicationId
-    await updateAndroidId(id)
+    await upAppIdVersion(id, version)
 
     // set github env
     setGithubEnv(name, version, pubBody)
+
+    // create keystore
+    await createKeystore()
+
+    // copy html to android res dir
+    const userAgent = webview.userAgent
+    const clearCache = webview.clearCache
+    // set app.json
+    await initWebEnv(
+        isHtml,
+        webUrl,
+        debug,
+        safeArea,
+        userAgent,
+        launchImage,
+        screenOn,
+        clearCache,
+        callPhone,
+        download,
+        internet,
+        position,
+        startMethod
+    )
+
+    // update manifest.xml
+    await updateManifest(direction)
 
     // success
     console.log('✅ Worker Success')

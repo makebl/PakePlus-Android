@@ -6,6 +6,11 @@ on:
     #     branches:
     #         - 'main'
 
+permissions:
+    contents: write
+    pages: write
+    id-token: write
+
 jobs:
     build:
         name: Build APK
@@ -24,15 +29,21 @@ jobs:
             - name: Set up Android SDK
               uses: android-actions/setup-android@v3
 
-            - uses: pnpm/action-setup@v3
+            - uses: pnpm/action-setup@v4
               with:
-                  version: latest
+                  version: 10
 
             - name: Sync node version and setup cache
               uses: actions/setup-node@v4
               with:
-                  node-version: 20
+                  node-version: 22.14.0
                   cache: pnpm
+
+            - name: Install ImageMagick
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install imagemagick
+                  convert --version
 
             - name: Init Project Config
               run: |
@@ -43,7 +54,7 @@ jobs:
               run: chmod +x ./gradlew
 
             - name: Build Debug APK
-              run: ./gradlew assembleDebug
+              run: ./gradlew assembleDebug --no-daemon
 
             - name: Rename APK file
               run: |
